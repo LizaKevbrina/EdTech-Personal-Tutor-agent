@@ -1,0 +1,290 @@
+"""
+Student progress and learning state memory.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from qdrant_client import models
+
+from src.agent.retrieval.qdrant_client import qdrant_manager
+from src.core.config import settings
+from src.core.exceptions import MemoryError, StudentNotFoundError
+from src.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class StudentProgress:
+    """Student learning progress and state."""
+
+    student_id: str
+    completed_topics: list[str] = field(default_factory=list)
+    difficult_topics: dict[str, int] = field(default_factory=dict)  # topic -> fail_count
+    learning_pace: str = "normal"  # "fast", "normal", "slow"
+    preferred_format: str = "text"  # "text", "video", "interactive"
+    total_questions: int = 0
+    total_quizzes: int = 0
+    quiz_pass_rate: float = 0.0
+    last_active: datetime = field(default_factory=datetime.now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for storage."""
+        return {
+            "student_id": self.student_id,
+            "completed_topics": self.completed_topics,
+            "difficult_topics": self.difficult_topics,
+            "learning_pace": self.learning_pace,
+            "preferred_format": self.preferred_format,
+            "total_questions": self.total_questions,
+            "total_quizzes": self.total_quizzes,
+            "quiz_pass_rate": self.quiz_pass_rate,
+            "last_active": self.last_active.isoformat(),
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StudentProgress":
+        """Create from dictionary."""
+        return cls(
+            student_id=data["student_id"],
+            completed_topics=data.get("completed_topics", []),
+            difficult_topics=data.get("difficult_topics", {}),
+            learning_pace=data.get("learning_pace", "normal"),
+            preferred_format=data.get("preferred_format", "text"),
+            total_questions=data.get("total_questions", 0),
+            total_quizzes=data.get("total_quizzes", 0),
+            quiz_pass_rate=data.get("quiz_pass_rate", 0.0),
+            last_active=datetime.fromisoformat(
+                data.get("last_active", datetime.now().isoformat())
+            ),
+            metadata=data.get("metadata", {}),
+        )
+
+
+class StudentMemoryManager:
+    """
+    Manages student progress and learning state in Qdrant.
+    """
+
+    def __init__(self) -> None:
+        """Initialize student memory manager."""
+        self.collection_name = settings.qdrant_collection_history
+
+    async def load_student(self, student_id: str) -> StudentProgress:
+        """
+        Load student progress from storage.
+        
+        Args:
+            student_id: Unique student identifier
+            
+        Returns:
+            StudentProgress object
+            
+        Raises:
+            StudentNotFoundError: If student doesn't exist
+        """
+        try:
+            logger.debug("loading_student_progress", student_id=student_id)
+
+            # Search for student record
+            results = await qdrant_manager.search(
+                collection_name=self.collection_name,
+                query_vector=[0.0] * settings.embedding_dimensions,  # Dummy vector
+                limit=1,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="student_id",
+                            match=models.MatchValue(value=student_id),
+                        )
+                    ]
+                ),
+            )
+
+            if not results:
+                # Create new student
+                logger.info("creating_new_student", student_id=student_id)
+                progress = StudentProgress(student_id=student_id)
+                await self.save_student(progress)
+                return progress
+
+            # Load existing student
+            progress = StudentProgress.from_dict(results[0].payload)
+
+            logger.info("student_progress_loaded", student_id=student_id)
+
+            return progress
+
+        except Exception as e:
+            logger.error(
+                "load_student_failed",
+                student_id=student_id,
+                error=str(e),
+            )
+            raise MemoryError(
+                f"Failed to load student progress: {e}",
+                details={"student_id": student_id},
+            ) from e
+
+    async def save_student(self, progress: StudentProgress) -> None:
+        """
+        Save student progress to storage.
+        
+        Args:
+            progress: StudentProgress object
+            
+        Raises:
+            MemoryError: If save fails
+        """
+        try:
+            logger.debug("saving_student_progress", student_id=progress.student_id)
+
+            # Update last active timestamp
+            progress.last_active = datetime.now()
+
+            # Create point for Qdrant
+            point = models.PointStruct(
+                id=progress.student_id,
+                vector=[0.0] * settings.embedding_dimensions,  # Dummy vector
+                payload=progress.to_dict(),
+            )
+
+            await qdrant_manager.upsert(
+                collection_name=self.collection_name,
+                points=[point],
+            )
+
+            logger.info("student_progress_saved", student_id=progress.student_id)
+
+        except Exception as e:
+            logger.error(
+                "save_student_failed",
+                student_id=progress.student_id,
+                error=str(e),
+            )
+            raise MemoryError(
+                f"Failed to save student progress: {e}",
+                details={"student_id": progress.student_id},
+            ) from e
+
+    async def mark_topic_completed(
+        self, student_id: str, topic: str
+    ) -> StudentProgress:
+        """
+        Mark a topic as completed for a student.
+        
+        Args:
+            student_id: Student identifier
+            topic: Topic name
+            
+        Returns:
+            Updated StudentProgress
+        """
+        progress = await self.load_student(student_id)
+
+        if topic not in progress.completed_topics:
+            progress.completed_topics.append(topic)
+            logger.info(
+                "topic_completed",
+                student_id=student_id,
+                topic=topic,
+            )
+
+        await self.save_student(progress)
+        return progress
+
+    async def mark_topic_difficult(
+        self, student_id: str, topic: str
+    ) -> StudentProgress:
+        """
+        Mark a topic as difficult for a student.
+        
+        Args:
+            student_id: Student identifier
+            topic: Topic name
+            
+        Returns:
+            Updated StudentProgress
+        """
+        progress = await self.load_student(student_id)
+
+        # Increment difficulty count
+        progress.difficult_topics[topic] = progress.difficult_topics.get(topic, 0) + 1
+
+        logger.info(
+            "topic_marked_difficult",
+            student_id=student_id,
+            topic=topic,
+            difficulty_count=progress.difficult_topics[topic],
+        )
+
+        await self.save_student(progress)
+        return progress
+
+    async def update_quiz_stats(
+        self, student_id: str, passed: bool
+    ) -> StudentProgress:
+        """
+        Update quiz statistics for a student.
+        
+        Args:
+            student_id: Student identifier
+            passed: Whether quiz was passed
+            
+        Returns:
+            Updated StudentProgress
+        """
+        progress = await self.load_student(student_id)
+
+        progress.total_quizzes += 1
+        passed_count = int(progress.quiz_pass_rate * (progress.total_quizzes - 1))
+
+        if passed:
+            passed_count += 1
+
+        progress.quiz_pass_rate = passed_count / progress.total_quizzes
+
+        logger.info(
+            "quiz_stats_updated",
+            student_id=student_id,
+            passed=passed,
+            pass_rate=progress.quiz_pass_rate,
+        )
+
+        await self.save_student(progress)
+        return progress
+
+    def get_summary(self, progress: StudentProgress) -> str:
+        """
+        Get a human-readable summary of student progress.
+        
+        Args:
+            progress: StudentProgress object
+            
+        Returns:
+            Summary string
+        """
+        summary_parts = [
+            f"Student ID: {progress.student_id}",
+            f"Completed topics: {len(progress.completed_topics)}",
+            f"Learning pace: {progress.learning_pace}",
+            f"Preferred format: {progress.preferred_format}",
+            f"Total questions asked: {progress.total_questions}",
+            f"Quiz pass rate: {progress.quiz_pass_rate:.1%}",
+        ]
+
+        if progress.difficult_topics:
+            difficult = ", ".join(
+                f"{topic} ({count}x)"
+                for topic, count in progress.difficult_topics.items()
+            )
+            summary_parts.append(f"Difficult topics: {difficult}")
+
+        return "\n".join(summary_parts)
+
+
+# Global instance
+student_memory = StudentMemoryManager()
